@@ -1,0 +1,211 @@
+import streamlit as st
+import os
+import faiss
+import numpy as np
+import logging
+from PyPDF2 import PdfReader
+import chardet
+import requests
+from sentence_transformers import SentenceTransformer
+import openai
+
+# ---- Streamlit Configuration ----
+st.set_page_config(page_title="Legal Document Chatbot", page_icon="📄", layout="wide")
+
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---- Constants ----
+DOCUMENTS_FOLDER = "./documents"
+CHUNK_SIZE = 1000
+BATCH_SIZE = 10
+encodings = ["utf-8", "latin-1", "windows-1252"]
+ALLOWED_SITES = [
+    "www.uitspraken.rechtspraak.nl",
+    "www.wetten.overheid.nl", 
+    "www.njb.nl",
+    "www.arsaequi.nl",
+    "www.mr-online.nl"
+]
+
+# ---- API Configuration ----
+OPENAI_API_KEY = "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"  # Replace with your actual OpenAI API key
+SERPAPI_KEY =  "2b724c7153d698803029f7ab40df7d75639c7b09f6fb285b93eabf4bfd16be3a"
+
+
+openai.api_key = OPENAI_API_KEY  # Set OpenAI API key
+client = openai  # Define client for OpenAI
+
+# ---- BERT Model ----
+bert_model = SentenceTransformer('all-MiniLM-L6-v2')  # Lightweight BERT model for embeddings
+
+# ---- Session State Initialization ----
+if 'index' not in st.session_state:
+    st.session_state.index = None
+if 'chunks' not in st.session_state:
+    st.session_state.chunks = []
+if 'documents_loaded' not in st.session_state:
+    st.session_state.documents_loaded = False
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+# ---- Helper Functions ----
+def detect_encoding(file_path):
+    with open(file_path, 'rb') as file:
+        raw_data = file.read()
+        result = chardet.detect(raw_data)
+        return result['encoding']
+
+def load_documents_as_text(folder_path):
+    documents_text = ""
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        if filename.endswith(".txt"):
+            try:
+                detected_encoding = detect_encoding(file_path)
+                with open(file_path, "r", encoding=detected_encoding or "utf-8", errors="replace") as file:
+                    documents_text += f"{filename}:\n{file.read()}\n"
+                logger.info(f"Successfully loaded {filename} with encoding {detected_encoding}")
+            except Exception as e:
+                logger.warning(f"Failed to load {filename}: {e}")
+        elif filename.endswith(".pdf"):
+            with open(file_path, "rb") as file:
+                documents_text += extract_text_from_pdf(file)
+    return documents_text
+
+def extract_text_from_pdf(uploaded_file):
+    reader = PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+def split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> list:
+    words = text.split()
+    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+def create_embeddings_in_batches_bert(text_chunks: list, batch_size: int = BATCH_SIZE) -> np.ndarray:
+    embeddings = []
+    total_batches = (len(text_chunks) + batch_size - 1) // batch_size
+    for i in range(total_batches):
+        batch = text_chunks[i * batch_size:(i + 1) * batch_size]
+        try:
+            batch_embeddings = bert_model.encode(batch)
+            embeddings.extend(batch_embeddings)
+            logger.info(f"Processed batch {i + 1}/{total_batches}")
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            break
+    return np.array(embeddings, dtype='float32')
+
+def create_single_embedding_bert(text: str) -> np.ndarray:
+    return np.array(bert_model.encode([text]), dtype='float32')[0]
+
+def initialize_index_with_chunks(documents_text: str):
+    if documents_text.strip():
+        chunks = split_text_into_chunks(documents_text)
+        embeddings = create_embeddings_in_batches_bert(chunks)
+        if len(embeddings) > 0:
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+            index.add(embeddings)
+            return index, chunks
+    return None, []
+
+def load_and_index_documents_on_startup():
+    if not st.session_state.documents_loaded:
+        st.info("Loading documents from folder...")
+        documents_text = load_documents_as_text(DOCUMENTS_FOLDER)
+        if documents_text:
+            index, chunks = initialize_index_with_chunks(documents_text)
+            if index:
+                st.session_state.index = index
+                st.session_state.chunks = chunks
+                st.session_state.documents_loaded = True
+                st.success("Documents loaded and indexed successfully!")
+
+def search_faiss_index(index, query_embedding, top_k=3):
+    if index is None:
+        raise ValueError("FAISS index is not initialized.")
+    distances, indices = index.search(np.array([query_embedding], dtype='float32'), top_k)
+    return indices[0]
+
+def search_online(query: str):
+    search_results = []
+    params = {
+        "q": query + " site:" + " OR site:".join(ALLOWED_SITES),
+        "api_key": SERPAPI_KEY,
+        "engine": "google"
+    }
+    response = requests.get("https://serpapi.com/search", params=params)
+    response.raise_for_status()
+    data = response.json()
+    for result in data.get("organic_results", []):
+        search_results.append(f"Title: {result.get('title')}\nLink: {result.get('link')}\nSnippet: {result.get('snippet')}")
+    return "\n\n".join(search_results)
+
+# ---- Interface ----
+st.title("📚 Legal Chatbot")
+
+load_and_index_documents_on_startup()
+
+user_question = st.text_input("Your legal question here:")
+if st.button("Search in Documents"):
+    query_embedding = create_single_embedding_bert(user_question)
+    relevant_indices = search_faiss_index(st.session_state.index, query_embedding)
+
+    # Limit the number of relevant chunks included in the context
+    max_chunks = 3  # Only include up to 3 chunks
+    selected_chunks = [st.session_state.chunks[i] for i in relevant_indices[:max_chunks]]
+    context = "\n".join(selected_chunks)
+
+    # Summarize context if it exceeds a certain length
+    if len(context.split()) > 1000:  # Limit to 1000 words
+        summary_prompt = (
+            f"Summarize the following legal context in a concise manner, preserving key details:\n\n{context}"
+        )
+        summary_response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful summarization assistant."},
+                {"role": "user", "content": summary_prompt}
+            ],
+            max_tokens=500,
+            temperature=0,
+        )
+        context = summary_response.choices[0].message.content.strip()
+
+    # Updated concise prompt
+    prompt = (
+        f"You are an AI assistant specializing in Dutch civil law. "
+        f"Always respond in Dutch. "
+        f"start every answer with a legal wordplay/joke. "
+        f"Your responses must be concise, accurate, and professional. "
+        f"Always include relevant legal references, such as Dutch legal articles and case law. "
+        f"Analyze and explain each referenced article or case in a clear, structured format.\n\n"
+        f"Use the following response structure:\n"
+        f"1. **Answer**: Provide a clear, direct response (but, when applying legal articles, apply the article to the question. when asked to, provide all subs of a legal article).\n"
+        f"2. **References**: Include relevant legal articles or literature sources.\n"
+        f"3. **Analysis**: Give a deeper explanation of the context and articles mentioned.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {user_question}"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are an AI assistant specializing in Dutch civil law."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=5000,  # Reduced max_tokens to leave space for the context
+        temperature=0,
+    )
+    st.session_state.chat_history.append((user_question, response.choices[0].message.content))
+
+if st.button("Search Online"):
+    online_results = search_online(user_question)
+    st.session_state.chat_history.append((user_question, online_results))
+
+for question, answer in st.session_state.chat_history:
+    st.markdown(f"**User:** {question}")
+    st.markdown(f"**AI:** {answer}")
